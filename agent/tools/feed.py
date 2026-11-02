@@ -1,17 +1,20 @@
 import asyncio
-import json
+import logging
 import os
 import re
+import tomllib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # carpeta agent/
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-FEED_URLS = [u.strip() for u in os.getenv("FEED_URLS", "").split(",") if u.strip()]
-NVD_API_URL = os.getenv("NVD_API_URL", "")
+log = logging.getLogger("feeds")
+FEEDS_FILE = os.path.join(BASE_DIR, os.getenv("FEEDS_FILE", "feeds.toml"))
 FETCH_TIMEOUT = 20.0
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -19,14 +22,51 @@ NS = {
     "content": "http://purl.org/rss/1.0/modules/content/",
 }
 TAG_RE = re.compile(r"<[^>]+>")
+CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+# Solo cuenta como puntuacion si aparece la palabra "score" o "puntuacion" (no la version "CVSS 3.1").
+CVSS_RE = re.compile(r"CVSS(?:\s*v?\d(?:\.\d)?)?[^0-9.]{0,30}?(?:score|puntuaci\w*)[^0-9]{0,15}(\d{1,2}\.\d)", re.IGNORECASE)
 
 
-def _clean(text: str, limit: int = 400) -> str:
+def _clean(text: str, limit: int | None = 400) -> str:
     if not text:
         return ""
     text = TAG_RE.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:limit] + ("…" if len(text) > limit else "")
+    if limit is None or len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
+def cargar_fuentes(ruta: str = FEEDS_FILE) -> list[dict]:
+    """Lee las fuentes activas de feeds.toml. Las entradas invalidas se registran y se omiten."""
+    if not os.path.exists(ruta):
+        log.error("No existe el fichero de fuentes: %s", ruta)
+        return []
+    with open(ruta, "rb") as f:
+        try:
+            datos = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            log.error("feeds.toml no es TOML valido: %s", e)
+            return []
+
+    fuentes = []
+    for i, entrada in enumerate(datos.get("fuente", []), start=1):
+        url = str(entrada.get("url", "")).strip()
+        nombre = str(entrada.get("nombre", "")).strip()
+        tipo = str(entrada.get("tipo", "rss")).strip().lower()
+        activa = entrada.get("activa", True)
+        etiqueta = nombre or f"entrada {i}"
+
+        if not activa:
+            continue
+        if urlparse(url).scheme not in ("http", "https") or not urlparse(url).netloc:
+            log.error("Fuente '%s' omitida: URL invalida (%r)", etiqueta, url)
+            continue
+        if tipo != "rss":
+            log.error("Fuente '%s' omitida: tipo '%s' no soportado (usa 'rss')", etiqueta, tipo)
+            continue
+        fuentes.append({"nombre": nombre or urlparse(url).netloc, "url": url})
+    return fuentes
 
 
 def _parse_label(entry, tag) -> str:
@@ -67,87 +107,75 @@ def _parse_xml(content: str) -> list[dict]:
                 _parse_label(entry, "description")
                 or _parse_label(entry, "content:encoded")
             )
-        items.append({"titulo": title, "link": link, "fecha": date, "resumen": _clean(summary)})
+        items.append({
+            "titulo": title,
+            "link": link,
+            "fecha": date,
+            "resumen": _clean(summary),
+            "texto": _clean(summary, limit=None),
+        })
     return items
 
 
-def _parse_nvd_json(content: str) -> list[dict]:
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as e:
-        return [{"error": f"JSON invalido de NVD: {e}"}]
-    items = []
-    for vuln in data.get("vulnerabilities", []):
-        cve = vuln.get("cve", {})
-        desc = ""
-        for d in cve.get("descriptions", []):
-            if d.get("lang") == "en":
-                desc = d.get("value", "")
-                break
-        metrics = ""
-        for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-            if cve.get("metrics", {}).get(key):
-                m = cve["metrics"][key][0]
-                metrics = f"CVSS {m.get('cvssData', {}).get('baseScore', '?')} - {m.get('cvssData', {}).get('baseSeverity', '')}"
-                break
-        items.append(
-            {
-                "titulo": cve.get("id", ""),
-                "link": f"https://nvd.nist.gov/vuln/detail/{cve.get('id', '')}",
-                "fecha": cve.get("published", ""),
-                "resumen": _clean(desc) + (f" [Severidad: {metrics}]" if metrics else ""),
-            }
-        )
-    return items
-
-
-async def _fetch(client: httpx.AsyncClient, url: str) -> dict:
+async def _fetch(client: httpx.AsyncClient, nombre: str, url: str) -> dict:
     try:
         resp = await client.get(url)
         resp.raise_for_status()
-        content = resp.text
-        if (NVD_API_URL and url.startswith(NVD_API_URL)) or "rest/json/cves" in url:
-            items = _parse_nvd_json(content)
-            fuente = "NVD (API 2.0)"
-        else:
-            items = _parse_xml(content)
-            m = re.search(r"https?://([^/]+)", url)
-            fuente = m.group(1) if m else url
+        items = _parse_xml(resp.text)
         if items and "error" in items[0]:
-            return {"fuente": fuente, "url": url, "items": [], "error": items[0]["error"]}
-        return {"fuente": fuente, "url": url, "items": items, "error": None}
+            return {"fuente": nombre, "url": url, "items": [], "error": items[0]["error"]}
+        return {"fuente": nombre, "url": url, "items": items, "error": None}
     except httpx.HTTPStatusError as e:
-        return {"fuente": url, "url": url, "items": [], "error": f"HTTP {e.response.status_code}"}
+        return {"fuente": nombre, "url": url, "items": [], "error": f"HTTP {e.response.status_code}"}
     except Exception as e:
-        return {"fuente": url, "url": url, "items": [], "error": str(e)}
+        return {"fuente": nombre, "url": url, "items": [], "error": str(e)}
 
 
-async def obtener_novedades(urls: list[str] | None = None, max_por_fuente: int = 10) -> dict:
-    """Descarga en paralelo las fuentes sindicadas y devuelve las ultimas novedades.
+async def obtener_novedades(max_por_fuente: int = 10) -> dict:
+    """Descarga en paralelo las fuentes activas de feeds.toml y devuelve sus ultimas entradas.
 
     Args:
-        urls: URLs opcionales (RSS/Atom o API de NVD). Si se omite usa FEED_URLS.
         max_por_fuente: cuantos items por fuente devolver.
 
     Returns:
-        dict con 'fuentes': [{fuente, url, items: [{titulo, link, fecha, resumen}], error}]
+        dict con 'fuentes': [{fuente, url, items: [{titulo, link, fecha, resumen, texto}], error}]
+        y 'error' (str o None) si no hay fuentes configuradas.
     """
-    if urls is None:
-        urls = FEED_URLS
-    if not urls:
-        return {"fuentes": [], "error": "No hay URLs configuradas (FEED_URLS vacio)"}
-    if isinstance(urls, str):
-        urls = [u.strip() for u in urls.split(",") if u.strip()]
-    invalid = [u for u in urls if not u.startswith("http")]
-    valid = [u for u in urls if u.startswith("http")]
+    fuentes = cargar_fuentes()
+    if not fuentes:
+        return {"fuentes": [], "error": "No hay fuentes activas en feeds.toml"}
 
     async with httpx.AsyncClient(timeout=FETCH_TIMEOUT, follow_redirects=True, headers={"User-Agent": "vuln-monitor-adk"}) as client:
-        resultados = list(await asyncio.gather(*[_fetch(client, u) for u in valid]))
-    for u in invalid:
-        resultados.append({"fuente": u, "url": u, "items": [], "error": "URL invalida (no empieza con http)"})
+        resultados = list(await asyncio.gather(*[_fetch(client, f["nombre"], f["url"]) for f in fuentes]))
     for r in resultados:
         r["items"] = r["items"][:max_por_fuente] if r["items"] else []
     return {"fuentes": resultados, "error": None}
+
+
+def extraer_metadatos(item: dict) -> dict:
+    """Extrae CVE y severidad del texto del item. Nada se inventa: si no aparece, queda vacio.
+
+    Returns:
+        dict con 'cve' (str) y 'severidad' (str, p. ej. 'Alta (CVSS 8.8)').
+    """
+    texto = f"{item.get('titulo', '')} {item.get('texto', '')}"
+    m_cve = CVE_RE.search(texto)
+    cve = m_cve.group(0).upper() if m_cve else ""
+
+    severidad = ""
+    m_cvss = CVSS_RE.search(texto)
+    if m_cvss:
+        puntuacion = float(m_cvss.group(1))
+        if puntuacion >= 9.0:
+            nivel = "Critica"
+        elif puntuacion >= 7.0:
+            nivel = "Alta"
+        elif puntuacion >= 4.0:
+            nivel = "Media"
+        else:
+            nivel = "Baja"
+        severidad = f"{nivel} (CVSS {m_cvss.group(1)})"
+    return {"cve": cve, "severidad": severidad}
 
 
 def formas_de_error_demo():  # pragma: no cover

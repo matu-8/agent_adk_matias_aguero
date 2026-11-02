@@ -50,34 +50,52 @@ def consultar_noticia(titulo_resumen: str) -> dict:
         "duplicada": distancia <= UMBRAL_DISTANCIA,
         "distancia": round(float(distancia), 4),
         "coincidencia": doc.metadata.get("titulo"),
+        "estado": doc.metadata.get("estado"),
         "error": None,
     }
 
 
-def registrar_noticia(titulo: str, fuente: str, link: str) -> dict:
-    """Guarda una noticia ya notificada en la memoria para futuras deduplicaciones.
+def enlace_registrado(link: str) -> bool:
+    """Comprueba por ID exacto (sha256 del enlace) si la noticia ya esta en la memoria."""
+    doc_id = hashlib.sha256((link or "").strip().encode("utf-8")).hexdigest()
+    return bool(_store().get(ids=[doc_id]).get("ids"))
+
+
+def registrar_noticia(
+    titulo: str,
+    fuente: str,
+    link: str,
+    estado: str = "notificada",
+    motivo: str = "",
+) -> dict:
+    """Guarda una noticia en la memoria para futuras deduplicaciones.
 
     Args:
         titulo: titulo de la noticia.
-        fuente: nombre de la fuente (dominio o 'NVD (API 2.0)').
+        fuente: nombre de la fuente configurada en feeds.toml.
         link: enlace original; se usa como identificador unico.
+        estado: 'notificada', 'descartada' o 'error_modelo'.
+        motivo: razon del descarte o del error (opcional).
 
     Returns:
-        dict con 'ok' (bool) y 'error' (str o None).
+        dict con 'ok' (bool), 'error' (str o None) y 'ya_existia' (bool).
     """
     titulo, fuente, link = (titulo or "").strip(), (fuente or "").strip(), (link or "").strip()
     if not titulo or not link:
-        return {"ok": False, "error": "titulo y link son obligatorios"}
+        return {"ok": False, "error": "titulo y link son obligatorios", "ya_existia": False}
     doc_id = hashlib.sha256(link.encode("utf-8")).hexdigest()
     try:
-        _store().add_texts(
+        store = _store()
+        if store.get(ids=[doc_id]).get("ids"):
+            return {"ok": True, "error": None, "ya_existia": True}
+        store.add_texts(
             texts=[titulo],
-            metadatas=[{"titulo": titulo, "fuente": fuente, "link": link}],
+            metadatas=[{"titulo": titulo, "fuente": fuente, "link": link, "estado": estado, "motivo": motivo}],
             ids=[doc_id],
         )
     except Exception as e:
-        return {"ok": False, "error": f"no se pudo registrar: {e}"}
-    return {"ok": True, "error": None}
+        return {"ok": False, "error": f"no se pudo registrar: {e}", "ya_existia": False}
+    return {"ok": True, "error": None, "ya_existia": False}
 
 
 def index_data(query: str, collection_name: str):
