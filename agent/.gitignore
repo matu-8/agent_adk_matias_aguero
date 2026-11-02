@@ -1,2 +1,4 @@
 .env
 .adk/
+vector_store/
+context.md
